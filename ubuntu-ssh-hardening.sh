@@ -14,6 +14,8 @@
 # - Configura fail2ban para SSH.
 # - Configura rotación de logs de autenticación.
 # - Activa UFW permitiendo el nuevo puerto SSH antes de habilitar el firewall.
+# - Deja una regla temporal para 22/tcp como recuperación.
+# - Opcionalmente agrega el usuario al grupo docker para usar docker ps sin sudo.
 #
 # USO:
 #   sudo bash ubuntu-ssh-hardening.sh
@@ -110,12 +112,9 @@ ask_public_key() {
 
 validate_cidr_or_ip_basic() {
   local value="$1"
-
-  # Validación básica. No intenta reemplazar validadores completos de IPv4/IPv6/CIDR.
   if [[ "$value" =~ ^[0-9a-fA-F:.]+(/[0-9]{1,3})?$ ]]; then
     return 0
   fi
-
   return 1
 }
 
@@ -133,6 +132,7 @@ create_backup() {
   [[ -f "$SSH_DROPIN" ]] && cp -a "$SSH_DROPIN" "$BACKUP_DIR/99-hardening.conf.bak"
   [[ -f "$FAIL2BAN_JAIL" ]] && cp -a "$FAIL2BAN_JAIL" "$BACKUP_DIR/sshd-hardening.local.bak"
   [[ -f "$LOGROTATE_AUTH" ]] && cp -a "$LOGROTATE_AUTH" "$BACKUP_DIR/auth-hardening.bak"
+  [[ -f /etc/systemd/system/ssh.socket.d/override.conf ]] && cp -a /etc/systemd/system/ssh.socket.d/override.conf "$BACKUP_DIR/ssh.socket.override.conf.bak"
 
   ok "Backup guardado en $BACKUP_DIR"
 }
@@ -144,9 +144,6 @@ ensure_user() {
     info "El usuario $user ya existe."
   else
     info "Creando usuario $user..."
-
-    # adduser falla si existe un grupo con el mismo nombre, aunque el usuario no exista.
-    # Por eso, si el grupo ya existe, usamos useradd -g.
     if getent group "$user" >/dev/null 2>&1; then
       warn "Existe el grupo $user pero no el usuario. Creando usuario usando ese grupo existente."
       useradd -m -s /bin/bash -g "$user" "$user"
@@ -158,6 +155,36 @@ ensure_user() {
 
   usermod -aG sudo "$user"
   ok "Usuario $user agregado al grupo sudo."
+}
+
+configure_docker_group() {
+  local user="$1"
+
+  if ! ask_yes_no "¿Querés que el usuario $user pueda ejecutar 'docker ps' sin sudo?" "S"; then
+    info "No se modificó membresía del grupo docker."
+    return 0
+  fi
+
+  if getent group docker >/dev/null 2>&1; then
+    usermod -aG docker "$user"
+    ok "Usuario $user agregado al grupo docker."
+  elif command -v docker >/dev/null 2>&1; then
+    groupadd docker
+    usermod -aG docker "$user"
+    ok "Grupo docker creado y usuario $user agregado."
+  else
+    warn "Docker no parece estar instalado y no existe el grupo docker."
+    if ask_yes_no "¿Crear igualmente el grupo docker y agregar el usuario?" "N"; then
+      groupadd docker
+      usermod -aG docker "$user"
+      ok "Grupo docker creado y usuario $user agregado."
+    else
+      warn "No se creó grupo docker."
+    fi
+  fi
+
+  warn "El cambio de grupo docker aplica en el próximo login del usuario."
+  warn "Importante: pertenecer al grupo docker equivale prácticamente a privilegios root sobre el host."
 }
 
 install_public_key() {
@@ -229,7 +256,7 @@ configure_ssh_socket_if_needed() {
   local port="$1"
 
   if systemctl list-unit-files ssh.socket >/dev/null 2>&1; then
-    if systemctl is-enabled ssh.socket >/dev/null 2>&1 || systemctl is-active ssh.socket >/dev/null 2>&1; then
+    if systemctl is-enabled --quiet ssh.socket || systemctl is-active --quiet ssh.socket; then
       info "Detecté ssh.socket. Configurando ListenStream para el puerto $port..."
 
       mkdir -p /etc/systemd/system/ssh.socket.d
@@ -260,10 +287,12 @@ configure_ufw() {
 
   info "Configurando UFW..."
 
-  # No reseteamos UFW por defecto para no borrar reglas existentes.
-  # Solo aplicamos defaults y agregamos el puerto SSH.
   ufw default deny incoming
   ufw default allow outgoing
+
+  # Regla temporal de recuperación.
+  # Se elimina manualmente cuando el puerto nuevo ya fue probado.
+  ufw allow 22/tcp comment "TEMP SSH recovery - remove after testing"
 
   if [[ "$restrict_source" == "yes" ]]; then
     ufw allow from "$source_cidr" to any port "$port" proto tcp comment "SSH hardened restricted"
@@ -310,9 +339,9 @@ configure_logrotate() {
 # Rota si supera 100M, conserva 50 rotaciones comprimidas.
 # Límite aproximado sin compresión: 5G.
 /var/log/auth.log /var/log/fail2ban.log {
-    daily
-    rotate 50
+    su root adm
     size 100M
+    rotate 50
     missingok
     notifempty
     compress
@@ -322,8 +351,11 @@ configure_logrotate() {
 }
 EOF
 
-  logrotate -d "$LOGROTATE_AUTH" >/dev/null
-  ok "Logrotate configurado."
+  if logrotate -d "$LOGROTATE_AUTH" >/dev/null; then
+    ok "Logrotate configurado."
+  else
+    warn "Logrotate mostró advertencias. Revisar con: sudo logrotate -d $LOGROTATE_AUTH"
+  fi
 }
 
 show_summary() {
@@ -345,10 +377,19 @@ show_summary() {
   echo "Ver Fail2Ban:"
   echo "  sudo fail2ban-client status sshd"
   echo
+  echo "Ver grupos del usuario:"
+  echo "  id $user"
+  echo
+  echo "Probar Docker sin sudo, en una nueva sesión SSH:"
+  echo "  docker ps"
+  echo
   echo "Backups:"
   echo "  $BACKUP_DIR"
   echo
   warn "No cierres la consola actual hasta probar una nueva conexión SSH."
+  warn "Cuando confirmes que el puerto nuevo funciona, eliminá la regla temporal de 22/tcp con:"
+  echo "  sudo ufw status numbered"
+  echo "  sudo ufw delete NUMERO_DE_REGLA_22"
 }
 
 main() {
@@ -388,6 +429,7 @@ main() {
   fi
   echo "  PasswordAuthentication: no"
   echo "  PermitRootLogin: no"
+  echo "  Regla temporal UFW: 22/tcp permitido para recuperación"
   echo
 
   if ! ask_yes_no "¿Aplicar esta configuración?" "N"; then
@@ -398,6 +440,7 @@ main() {
   install_packages
   create_backup
   ensure_user "$admin_user"
+  configure_docker_group "$admin_user"
   install_public_key "$admin_user" "$public_key"
   configure_sshd "$admin_user" "$ssh_port"
   configure_ufw "$ssh_port" "$restrict_source" "$source_cidr"
