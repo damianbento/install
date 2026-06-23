@@ -12,7 +12,7 @@
 # - Deshabilita autenticación por password.
 # - Activa autenticación por clave pública.
 # - Configura fail2ban para SSH.
-# - Configura rotación de logs de autenticación para evitar crecimiento excesivo.
+# - Configura rotación de logs de autenticación.
 # - Activa UFW permitiendo el nuevo puerto SSH antes de habilitar el firewall.
 #
 # USO:
@@ -46,7 +46,7 @@ ask_yes_no() {
   local answer
 
   while true; do
-    if [[ "$default" =~ ^[YySsíSI]$ ]]; then
+    if [[ "$default" =~ ^[YySs]$ ]]; then
       read -r -p "$prompt [S/n]: " answer
       answer="${answer:-S}"
     else
@@ -79,14 +79,14 @@ ask_port() {
 ask_user() {
   local user
   while true; do
-    read -r -p "Usuario administrativo remoto [admin]: " user
-    user="${user:-admin}"
+    read -r -p "Usuario administrativo remoto [sshadmin]: " user
+    user="${user:-sshadmin}"
 
     if [[ "$user" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then
       echo "$user"
       return 0
     fi
-    echo "Nombre de usuario inválido. Ejemplo: damian, admin, soporte."
+    echo "Nombre de usuario inválido. Ejemplo: damian, sshadmin, soporte."
   done
 }
 
@@ -106,6 +106,17 @@ ask_public_key() {
     fi
     echo "La clave no parece válida. Copiá el contenido completo de tu archivo .pub."
   done
+}
+
+validate_cidr_or_ip_basic() {
+  local value="$1"
+
+  # Validación básica. No intenta reemplazar validadores completos de IPv4/IPv6/CIDR.
+  if [[ "$value" =~ ^[0-9a-fA-F:.]+(/[0-9]{1,3})?$ ]]; then
+    return 0
+  fi
+
+  return 1
 }
 
 install_packages() {
@@ -133,7 +144,16 @@ ensure_user() {
     info "El usuario $user ya existe."
   else
     info "Creando usuario $user..."
-    adduser --gecos "" "$user"
+
+    # adduser falla si existe un grupo con el mismo nombre, aunque el usuario no exista.
+    # Por eso, si el grupo ya existe, usamos useradd -g.
+    if getent group "$user" >/dev/null 2>&1; then
+      warn "Existe el grupo $user pero no el usuario. Creando usuario usando ese grupo existente."
+      useradd -m -s /bin/bash -g "$user" "$user"
+      passwd "$user"
+    else
+      adduser --gecos "" "$user"
+    fi
   fi
 
   usermod -aG sudo "$user"
@@ -169,6 +189,8 @@ configure_sshd() {
   local port="$2"
 
   info "Configurando hardening SSH en $SSH_DROPIN..."
+
+  mkdir -p /etc/ssh/sshd_config.d
 
   cat > "$SSH_DROPIN" <<EOF
 # Gestionado por ubuntu-ssh-hardening.sh
@@ -221,6 +243,7 @@ EOF
 
       systemctl daemon-reload
       systemctl restart ssh.socket
+      systemctl restart ssh || true
       ok "ssh.socket configurado en el puerto $port."
       return 0
     fi
@@ -237,7 +260,8 @@ configure_ufw() {
 
   info "Configurando UFW..."
 
-  ufw --force reset
+  # No reseteamos UFW por defecto para no borrar reglas existentes.
+  # Solo aplicamos defaults y agregamos el puerto SSH.
   ufw default deny incoming
   ufw default allow outgoing
 
@@ -258,6 +282,8 @@ configure_fail2ban() {
   local port="$1"
 
   info "Configurando Fail2Ban para SSH..."
+
+  mkdir -p /etc/fail2ban/jail.d
 
   cat > "$FAIL2BAN_JAIL" <<EOF
 # Gestionado por ubuntu-ssh-hardening.sh
@@ -297,7 +323,7 @@ configure_logrotate() {
 EOF
 
   logrotate -d "$LOGROTATE_AUTH" >/dev/null
-  ok "Logrotate configurado. Los logs se rotarán antes de superar un crecimiento excesivo."
+  ok "Logrotate configurado."
 }
 
 show_summary() {
@@ -309,6 +335,9 @@ show_summary() {
   echo
   echo "Probá desde tu PC:"
   echo "  ssh -p $port $user@IP_DEL_SERVIDOR"
+  echo
+  echo "Ver puerto escuchando:"
+  echo "  sudo ss -tlnp | grep ssh"
   echo
   echo "Ver estado de UFW:"
   echo "  sudo ufw status numbered"
@@ -338,11 +367,14 @@ main() {
   source_cidr=""
   if ask_yes_no "¿Querés limitar SSH a una IP o red de origen? Ej: 181.10.20.30 o 192.168.1.0/24" "N"; then
     restrict_source="yes"
-    read -r -p "Origen permitido para SSH: " source_cidr
-    if [[ -z "$source_cidr" ]]; then
-      err "Origen vacío. Abortando para evitar bloquearte."
-      exit 1
-    fi
+
+    while true; do
+      read -r -p "Origen permitido para SSH: " source_cidr
+      if [[ -n "$source_cidr" ]] && validate_cidr_or_ip_basic "$source_cidr"; then
+        break
+      fi
+      echo "Origen inválido o vacío. Ejemplos: 181.10.20.30 o 192.168.1.0/24"
+    done
   fi
 
   echo
