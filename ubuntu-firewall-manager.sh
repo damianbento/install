@@ -2,19 +2,16 @@
 # ubuntu-firewall-manager.sh
 # Gestor simple de firewall UFW para usuarios finales.
 #
-# Qué permite:
-# - Ver estado del firewall.
-# - Ver reglas numeradas.
-# - Permitir un puerto desde cualquier origen.
-# - Permitir un puerto desde una IP o red concreta.
-# - Bloquear un puerto.
-# - Eliminar reglas por número.
-# - Activar / desactivar UFW.
+# La primera vez que se ejecuta, se puede auto-instalar en:
+# /usr/local/sbin/ubuntu-firewall-manager
 #
 # USO:
 #   sudo bash ubuntu-firewall-manager.sh
+#   sudo ubuntu-firewall-manager
 
 set -Eeuo pipefail
+
+INSTALL_PATH="/usr/local/sbin/ubuntu-firewall-manager"
 
 info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 ok() { echo -e "\033[1;32m[OK]\033[0m $*"; }
@@ -25,6 +22,57 @@ require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
     err "Ejecutá este script como root o con sudo."
     exit 1
+  fi
+}
+
+ask_yes_no() {
+  local prompt="$1"
+  local default="${2:-N}"
+  local answer
+
+  while true; do
+    if [[ "$default" =~ ^[YySs]$ ]]; then
+      read -r -p "$prompt [S/n]: " answer
+      answer="${answer:-S}"
+    else
+      read -r -p "$prompt [s/N]: " answer
+      answer="${answer:-N}"
+    fi
+
+    case "$answer" in
+      s|S|si|SI|sí|SÍ|y|Y|yes|YES) return 0 ;;
+      n|N|no|NO) return 1 ;;
+      *) echo "Respondé s o n." ;;
+    esac
+  done
+}
+
+self_install_if_needed() {
+  local current_path
+
+  current_path="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+
+  if [[ "$current_path" == "$INSTALL_PATH" ]]; then
+    return 0
+  fi
+
+  echo
+  info "Este script no está instalado globalmente."
+  echo "Ruta actual:      $current_path"
+  echo "Ruta recomendada: $INSTALL_PATH"
+  echo
+
+  if ask_yes_no "¿Querés instalarlo en /usr/local/sbin para que cualquier usuario con sudo pueda ejecutarlo?" "S"; then
+    install -o root -g root -m 755 "$current_path" "$INSTALL_PATH"
+    ok "Instalado en $INSTALL_PATH"
+    echo
+    echo "Desde ahora podés ejecutarlo con:"
+    echo "  sudo ubuntu-firewall-manager"
+    echo
+
+    if ask_yes_no "¿Querés continuar ejecutando la versión instalada ahora?" "S"; then
+      exec "$INSTALL_PATH"
+    fi
   fi
 }
 
@@ -196,6 +244,17 @@ set_defaults() {
   esac
 }
 
+show_install_info() {
+  echo
+  echo "Ruta instalada:"
+  if [[ -f "$INSTALL_PATH" ]]; then
+    ls -l "$INSTALL_PATH"
+  else
+    echo "No instalado en $INSTALL_PATH"
+  fi
+  echo
+}
+
 menu() {
   while true; do
     clear
@@ -210,6 +269,7 @@ menu() {
     echo "7) Activar firewall"
     echo "8) Desactivar firewall"
     echo "9) Aplicar defaults seguros"
+    echo "10) Ver ruta de instalación del script"
     echo "0) Salir"
     echo
     read -r -p "Opción: " option
@@ -224,6 +284,7 @@ menu() {
       7) enable_firewall; pause ;;
       8) disable_firewall; pause ;;
       9) set_defaults; pause ;;
+      10) show_install_info; pause ;;
       0) exit 0 ;;
       *) echo "Opción inválida."; sleep 1 ;;
     esac
@@ -232,6 +293,7 @@ menu() {
 
 main() {
   require_root
+  self_install_if_needed
   ensure_ufw
   menu
 }
