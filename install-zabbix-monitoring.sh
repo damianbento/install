@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 DRY_RUN=0
 [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
 
@@ -1190,7 +1190,7 @@ write_readme() {
   cat >"$INSTALL_DIR/README.md" <<EOF
 # Monitoreo cloud
 
-Instalador versión: `$SCRIPT_VERSION`
+Instalador versión: \`$SCRIPT_VERSION\`
 
 Instalación generada por \`install-zabbix-monitoring.sh\`.
 
@@ -1619,11 +1619,14 @@ cd "$INSTALL_DIR"
 docker compose config --quiet
 ok "Docker Compose validado."
 
-for secret_file in secrets/postgres_user.txt secrets/postgres_password.txt; do
+for secret_file in \
+  secrets/postgres_password.txt \
+  secrets/grafana_admin_password.txt \
+  secrets/zabbix_admin_password.txt; do
   [[ -s "$secret_file" ]] || die "El secreto $secret_file está vacío o no existe."
-  chmod 600 "$secret_file"
+  chmod 644 "$secret_file"
 done
-ok "Secretos PostgreSQL validados."
+ok "Secretos validados."
 
 info "Descargando imágenes..."
 docker compose pull
@@ -1664,6 +1667,7 @@ python3 "$INSTALL_DIR/scripts/bootstrap_zabbix.py" "${BOOTSTRAP_ARGS[@]}"
 
 info "Iniciando Grafana..."
 docker compose up -d grafana
+
 
 GRAFANA_BOOTSTRAP_HOST="$GRAFANA_BIND_IP"
 [[ "$GRAFANA_BOOTSTRAP_HOST" == "0.0.0.0" || "$GRAFANA_BOOTSTRAP_HOST" == "::" ]] && GRAFANA_BOOTSTRAP_HOST="127.0.0.1"
