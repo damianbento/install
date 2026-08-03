@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.2.0"
 DRY_RUN=0
 [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
 
@@ -871,6 +871,13 @@ def main():
         )
         print("[OK] Contraseña inicial de Zabbix cambiada.")
 
+        # Zabbix invalida la sesión que realizó el cambio de contraseña.
+        # Volvemos a iniciar sesión antes de continuar con housekeeping,
+        # autorregistro, acciones y creación del token para Grafana.
+        api.auth = None
+        api.login("Admin", new_password)
+        print("[OK] Nueva sesión API iniciada después del cambio de contraseña.")
+
     api.call(
         "housekeeping.update",
         {
@@ -1663,22 +1670,29 @@ if [[ "$AGENT_TLS_MODE" == "psk" ]]; then
     --psk-file "$INSTALL_DIR/agents/linux/zabbix_agent2.psk"
   )
 fi
-python3 "$INSTALL_DIR/scripts/bootstrap_zabbix.py" "${BOOTSTRAP_ARGS[@]}"
+info "Aplicando configuración automática de Zabbix..."
+python3 -u "$INSTALL_DIR/scripts/bootstrap_zabbix.py" "${BOOTSTRAP_ARGS[@]}"
+ok "Configuración automática de Zabbix terminada."
+
+[[ -s "$INSTALL_DIR/secrets/zabbix_grafana_api_token.txt" ]] ||
+  die "Zabbix no generó el API token requerido por Grafana."
+chmod 600 "$INSTALL_DIR/secrets/zabbix_grafana_api_token.txt"
 
 info "Iniciando Grafana..."
 docker compose up -d grafana
-
 
 GRAFANA_BOOTSTRAP_HOST="$GRAFANA_BIND_IP"
 [[ "$GRAFANA_BOOTSTRAP_HOST" == "0.0.0.0" || "$GRAFANA_BOOTSTRAP_HOST" == "::" ]] && GRAFANA_BOOTSTRAP_HOST="127.0.0.1"
 GRAFANA_BOOTSTRAP_URL="http://$GRAFANA_BOOTSTRAP_HOST:$GRAFANA_PORT"
 wait_for_grafana "$GRAFANA_BOOTSTRAP_URL"
 
-python3 "$INSTALL_DIR/scripts/configure_grafana.py" \
+info "Configurando el datasource Zabbix en Grafana..."
+python3 -u "$INSTALL_DIR/scripts/configure_grafana.py" \
   --grafana-url "$GRAFANA_BOOTSTRAP_URL" \
   --username "$GRAFANA_ADMIN_USER" \
   --password-file "$INSTALL_DIR/secrets/grafana_admin_password.txt" \
   --zabbix-token-file "$INSTALL_DIR/secrets/zabbix_grafana_api_token.txt"
+ok "Datasource Zabbix configurado en Grafana."
 
 if [[ "$DEPLOY_MODE" == "public" ]]; then
   info "Iniciando Caddy y solicitando certificados..."
@@ -1688,8 +1702,28 @@ fi
 configure_ufw
 install_backup_timer
 
-docker compose ps
-ok "Despliegue terminado."
+info "Validando el despliegue final..."
+docker compose ps -a
+
+[[ "$(docker inspect --format '{{.State.Health.Status}}' "${PROJECT_NAME}-postgres" 2>/dev/null)" == "healthy" ]] ||
+  die "PostgreSQL no está healthy al finalizar."
+
+[[ "$(docker inspect --format '{{.State.Status}}' "${PROJECT_NAME}-server" 2>/dev/null)" == "running" ]] ||
+  die "Zabbix Server no está ejecutándose al finalizar."
+
+[[ "$(docker inspect --format '{{.State.Status}}' "${PROJECT_NAME}-web" 2>/dev/null)" == "running" ]] ||
+  die "Zabbix Web no está ejecutándose al finalizar."
+
+[[ "$(docker inspect --format '{{.State.Status}}' "${PROJECT_NAME}-grafana" 2>/dev/null)" == "running" ]] ||
+  die "Grafana no está ejecutándose al finalizar."
+
+curl -fsS --max-time 10 "$ZABBIX_API_ENDPOINT"   -H 'Content-Type: application/json-rpc'   -d '{"jsonrpc":"2.0","method":"apiinfo.version","params":{},"id":1}'   | grep -q '"result"' ||
+  die "La API de Zabbix no respondió correctamente al finalizar."
+
+curl -fsS --max-time 10 "$GRAFANA_BOOTSTRAP_URL/api/health" >/dev/null ||
+  die "La API de salud de Grafana no respondió correctamente al finalizar."
+
+ok "Despliegue terminado y validado."
 
 cat <<EOF
 
